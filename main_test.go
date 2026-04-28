@@ -81,7 +81,7 @@ func TestTeeWriter(t *testing.T) {
 func TestSplitByContentLengthWriter(t *testing.T) {
 	t.Run("writes line without marker as-is", func(t *testing.T) {
 		var buf bytes.Buffer
-		writer := NewSplitByContentLengthWriter(&buf)
+		writer := NewSplitByContentLengthWriter(&buf, nil)
 
 		data := []byte("hello world\n")
 		n, err := writer.Write(data)
@@ -99,7 +99,7 @@ func TestSplitByContentLengthWriter(t *testing.T) {
 
 	t.Run("inserts newline before Content-Length marker", func(t *testing.T) {
 		var buf bytes.Buffer
-		writer := NewSplitByContentLengthWriter(&buf)
+		writer := NewSplitByContentLengthWriter(&buf, nil)
 
 		data := []byte("prefix Content-Length: 123\n")
 		n, err := writer.Write(data)
@@ -118,7 +118,7 @@ func TestSplitByContentLengthWriter(t *testing.T) {
 
 	t.Run("handles Content-Length at start of line", func(t *testing.T) {
 		var buf bytes.Buffer
-		writer := NewSplitByContentLengthWriter(&buf)
+		writer := NewSplitByContentLengthWriter(&buf, nil)
 
 		data := []byte("Content-Length: 456\n")
 		_, err := writer.Write(data)
@@ -134,7 +134,7 @@ func TestSplitByContentLengthWriter(t *testing.T) {
 
 	t.Run("handles multiple lines", func(t *testing.T) {
 		var buf bytes.Buffer
-		writer := NewSplitByContentLengthWriter(&buf)
+		writer := NewSplitByContentLengthWriter(&buf, nil)
 
 		data := []byte("line1\nline2 Content-Length: 789\nline3\n")
 		_, err := writer.Write(data)
@@ -150,7 +150,7 @@ func TestSplitByContentLengthWriter(t *testing.T) {
 
 	t.Run("buffers incomplete lines", func(t *testing.T) {
 		var buf bytes.Buffer
-		writer := NewSplitByContentLengthWriter(&buf)
+		writer := NewSplitByContentLengthWriter(&buf, nil)
 
 		data := []byte("incomplete")
 		n, err := writer.Write(data)
@@ -184,7 +184,7 @@ func TestSplitByContentLengthWriter(t *testing.T) {
 
 	t.Run("Flush writes incomplete buffer with Content-Length header", func(t *testing.T) {
 		var buf bytes.Buffer
-		writer := NewSplitByContentLengthWriter(&buf)
+		writer := NewSplitByContentLengthWriter(&buf, nil)
 
 		data := []byte("incomplete buffer")
 		_, err := writer.Write(data)
@@ -209,7 +209,7 @@ func TestSplitByContentLengthWriter(t *testing.T) {
 
 	t.Run("Flush on empty buffer is no-op", func(t *testing.T) {
 		var buf bytes.Buffer
-		writer := NewSplitByContentLengthWriter(&buf)
+		writer := NewSplitByContentLengthWriter(&buf, nil)
 
 		err := writer.Flush()
 		if err != nil {
@@ -223,7 +223,7 @@ func TestSplitByContentLengthWriter(t *testing.T) {
 
 	t.Run("handles Content-Length marker in incomplete line", func(t *testing.T) {
 		var buf bytes.Buffer
-		writer := NewSplitByContentLengthWriter(&buf)
+		writer := NewSplitByContentLengthWriter(&buf, nil)
 
 		data := []byte("prefix Content-Length: 999")
 		_, err := writer.Write(data)
@@ -248,7 +248,7 @@ func TestSplitByContentLengthWriter(t *testing.T) {
 func TestComposedWriters(t *testing.T) {
 	t.Run("TeeWriter with SplitByContentLengthWriter", func(t *testing.T) {
 		var buf1, buf2 bytes.Buffer
-		splitWriter := NewSplitByContentLengthWriter(&buf1)
+		splitWriter := NewSplitByContentLengthWriter(&buf1, nil)
 		tee := NewTeeWriter(splitWriter, &buf2)
 
 		data := []byte("test Content-Length: 123\n")
@@ -272,7 +272,7 @@ func TestComposedWriters(t *testing.T) {
 	t.Run("TimestampedWriter with SplitByContentLengthWriter", func(t *testing.T) {
 		var buf bytes.Buffer
 		timestamped := NewTimestampedWriter(&buf)
-		splitWriter := NewSplitByContentLengthWriter(timestamped)
+		splitWriter := NewSplitByContentLengthWriter(timestamped, nil)
 
 		data := []byte("prefix Content-Length: 456\n")
 		_, err := splitWriter.Write(data)
@@ -294,7 +294,7 @@ func TestComposedWriters(t *testing.T) {
 	t.Run("all three writers composed", func(t *testing.T) {
 		var buf1, buf2 bytes.Buffer
 		timestamped1 := NewTimestampedWriter(&buf1)
-		splitWriter := NewSplitByContentLengthWriter(timestamped1)
+		splitWriter := NewSplitByContentLengthWriter(timestamped1, nil)
 		tee := NewTeeWriter(splitWriter, &buf2)
 
 		data := []byte("hello Content-Length: 789\n")

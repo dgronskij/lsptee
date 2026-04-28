@@ -57,54 +57,79 @@ func tee(src io.Reader, w io.Writer) error {
     }
 }
 
+// fileSyncer is implemented by *os.File.
+type fileSyncer interface {
+	Sync() error
+}
+
 // SplitByContentLengthWriter wraps an io.Writer and buffers bytes until a newline is encountered.
 // For each complete line, it inserts a newline before any "Content-Length:" marker.
-// On Flush, it writes incomplete buffers with a Content-Length header.
+// On Flush, it writes incomplete buffers and syncs to disk.
 type SplitByContentLengthWriter struct {
-    w   io.Writer
-    buf []byte
+	w      io.Writer
+	buf    []byte
+	syncer fileSyncer // non-nil when underlying file supports Sync
 }
 
 // NewSplitByContentLengthWriter creates a new SplitByContentLengthWriter wrapping the given writer.
-func NewSplitByContentLengthWriter(w io.Writer) *SplitByContentLengthWriter {
-    return &SplitByContentLengthWriter{
-        w:   w,
-        buf: make([]byte, 0),
-    }
+// It discovers the underlying *os.File (through TimestampedWriter if needed) so it can
+// sync completed LSP messages to disk, preventing data loss from in-memory buffering.
+func NewSplitByContentLengthWriter(w io.Writer, syncer fileSyncer) *SplitByContentLengthWriter {
+	return &SplitByContentLengthWriter{
+		w:      w,
+		buf:    make([]byte, 0),
+		syncer: syncer,
+	}
+}
+
+// sync flushes the underlying file to disk if a syncer is available.
+func (l *SplitByContentLengthWriter) sync() error {
+	if l.syncer != nil {
+		return l.syncer.Sync()
+	}
+	return nil
 }
 
 // flushAsLine processes a complete line from the buffer and writes it, inserting a newline before any Content-Length marker.
+// When a Content-Length marker is found, it syncs to disk first — this ensures the previous LSP message body
+// (which had no trailing newline and was thus only flushed when this new header line arrived) is durable.
 func (l *SplitByContentLengthWriter) flushAsLine() error {
-    // Process complete line
-    line := l.buf
-    l.buf = l.buf[:0]
+	// Process complete line
+	line := l.buf
+	l.buf = l.buf[:0]
 
-    // Find Content-Length marker in the line
-    idx := bytes.Index(line, contentLengthMarker)
+	// Find Content-Length marker in the line
+	idx := bytes.Index(line, contentLengthMarker)
 
-    if idx == -1 {
-        // No marker found, write line as-is
-        if _, err := l.w.Write(line); err != nil {
-            return err
-        }
-        return nil
-    }
+	if idx == -1 {
+		// No marker found, write line as-is
+		if _, err := l.w.Write(line); err != nil {
+			return err
+		}
+		return nil
+	}
 
-    // Write everything before the marker (if any)
-    if idx > 0 {
-        if _, err := l.w.Write(line[:idx]); err != nil {
-            return err
-        }
-    }
-    // Insert newline before marker
-    if _, err := l.w.Write([]byte{'\n'}); err != nil {
-        return err
-    }
-    // Write marker and rest of line
-    if _, err := l.w.Write(line[idx:]); err != nil {
-        return err
-    }
-    return nil
+	// A Content-Length marker means a new LSP message is starting.
+	// Sync the previous message body to disk before continuing.
+	if err := l.sync(); err != nil {
+		return err
+	}
+
+	// Write everything before the marker (if any)
+	if idx > 0 {
+		if _, err := l.w.Write(line[:idx]); err != nil {
+			return err
+		}
+	}
+	// Insert newline before marker
+	if _, err := l.w.Write([]byte{'\n'}); err != nil {
+		return err
+	}
+	// Write marker and rest of line
+	if _, err := l.w.Write(line[idx:]); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Write implements io.Writer. It splits input by newlines, and for each line,
@@ -126,12 +151,14 @@ func (l *SplitByContentLengthWriter) Write(p []byte) (int, error) {
     return written, nil
 }
 
-// Flush writes any remaining buffered data with a Content-Length header.
+// Flush writes any remaining buffered data and syncs to disk.
 func (l *SplitByContentLengthWriter) Flush() error {
-    if len(l.buf) > 0 {
-        return l.flushAsLine()
-    }
-    return nil
+	if len(l.buf) > 0 {
+		if err := l.flushAsLine(); err != nil {
+			return err
+		}
+	}
+	return l.sync()
 }
 
 // TimestampedWriter wraps an io.Writer and prepends RFC3339 timestamps to each write.
@@ -246,15 +273,15 @@ func main() {
 
     // Build composed writers for logging
     var stdinLogger, stdoutLogger, stderrLogger *SplitByContentLengthWriter
-    if stdinLogFile != nil {
-        stdinLogger = NewSplitByContentLengthWriter(NewTimestampedWriter(stdinLogFile))
-    }
-    if stdoutLogFile != nil {
-        stdoutLogger = NewSplitByContentLengthWriter(NewTimestampedWriter(stdoutLogFile))
-    }
-    if stderrLogFile != nil {
-        stderrLogger = NewSplitByContentLengthWriter(NewTimestampedWriter(stderrLogFile))
-    }
+	if stdinLogFile != nil {
+		stdinLogger = NewSplitByContentLengthWriter(NewTimestampedWriter(stdinLogFile), stdinLogFile)
+	}
+	if stdoutLogFile != nil {
+		stdoutLogger = NewSplitByContentLengthWriter(NewTimestampedWriter(stdoutLogFile), stdoutLogFile)
+	}
+	if stderrLogFile != nil {
+		stderrLogger = NewSplitByContentLengthWriter(NewTimestampedWriter(stderrLogFile), stderrLogFile)
+	}
 
     // stdin: parent -> childStdin (bytewise), log line/Content-Length as appropriate
     wg.Add(1)
