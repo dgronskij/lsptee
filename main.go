@@ -105,12 +105,22 @@ func tee(ctx context.Context, src io.Reader, w io.Writer) error {
             }
         case <-ctx.Done():
             // Best-effort delivery of bytes already buffered in channel.
-            for b := range ch {
-                if _, err := w.Write([]byte{b}); err != nil {
-                    break
+            // Use non-blocking receives: the reader goroutine may still be
+            // blocked on src.Read() and will never close the channel, so
+            // 'range ch' would block forever.
+            for {
+                select {
+                case b, ok := <-ch:
+                    if !ok {
+                        return ctx.Err()
+                    }
+                    if _, err := w.Write([]byte{b}); err != nil {
+                        return ctx.Err()
+                    }
+                default:
+                    return ctx.Err()
                 }
             }
-            return ctx.Err()
         }
     }
 }
