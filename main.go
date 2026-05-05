@@ -2,6 +2,7 @@ package main
 
 import (
     "bytes"
+    "context"
     "flag"
     "fmt"
     "io"
@@ -38,21 +39,78 @@ func (t *TeeWriter) Write(p []byte) (int, error) {
 }
 
 // tee reads byte-by-byte from src and writes each byte to the provided writer.
-// Returns when src reaches EOF or encounters an error.
-func tee(src io.Reader, w io.Writer) error {
-    tmp := make([]byte, 1)
-    for {
-        n, err := src.Read(tmp)
-        if n > 0 {
-            if _, writeErr := w.Write(tmp[:n]); writeErr != nil {
-                return writeErr
+// It uses a channel to decouple the blocking Read from the Write, allowing the
+// context to cancel the write loop even when the read is blocked.
+//
+// When ctx is cancelled (e.g. because the other end of the pipeline exited),
+// the write loop drains any bytes already in the channel (best-effort delivery)
+// and returns. The reader goroutine may remain blocked on src.Read() after
+// cancellation — this is unavoidable since blocking reads on os.Stdin or pipe
+// fds cannot be interrupted without closing the fd. The leaked reader goroutine
+// is cleaned up when the process exits.
+func tee(ctx context.Context, src io.Reader, w io.Writer) error {
+    ch := make(chan byte, 4096)
+
+    // Reader goroutine: reads from src and pushes bytes into the channel.
+    // Exits only on src EOF/error. Does NOT check ctx — the writer side is
+    // responsible for cancellation. This ensures all bytes read from src before
+    // EOF are pushed into the channel and available for best-effort delivery.
+    //
+    // NOTE: this goroutine may outlive the writer loop if src.Read() blocks
+    // after ctx cancellation (e.g. os.Stdin on a terminal). This is unavoidable
+    // since blocking reads on os.Stdin or pipe fds cannot be interrupted without
+    // closing the fd. The leaked goroutine is cleaned up when the process exits.
+    go func() {
+        defer close(ch)
+        tmp := make([]byte, 1)
+        for {
+            n, err := src.Read(tmp)
+            if n > 0 {
+                ch <- tmp[0]
+            }
+            if err != nil {
+                return
             }
         }
-        if err != nil {
-            if err == io.EOF {
-                return nil
+    }()
+
+    // Writer loop: pulls bytes from channel, writes to destination.
+    // On ctx cancellation, drains remaining buffered bytes (best-effort).
+    //
+    // We prioritize draining the data channel over reacting to ctx.Done():
+    // first try a non-blocking receive from ch, and only if empty, select on both.
+    // This ensures bytes already read are delivered before we honour cancellation.
+    for {
+        // Priority: drain available data first.
+        select {
+        case b, ok := <-ch:
+            if !ok {
+                return nil // source EOF, channel closed
             }
-            return err
+            if _, err := w.Write([]byte{b}); err != nil {
+                return err
+            }
+            continue
+        default:
+        }
+
+        // No data ready — wait for either new data or cancellation.
+        select {
+        case b, ok := <-ch:
+            if !ok {
+                return nil // source EOF, channel closed
+            }
+            if _, err := w.Write([]byte{b}); err != nil {
+                return err
+            }
+        case <-ctx.Done():
+            // Best-effort delivery of bytes already buffered in channel.
+            for b := range ch {
+                if _, err := w.Write([]byte{b}); err != nil {
+                    break
+                }
+            }
+            return ctx.Err()
         }
     }
 }
@@ -269,6 +327,12 @@ func main() {
         os.Exit(1)
     }
 
+    // Context for cross-goroutine cancellation: when any tee goroutine's source
+    // reaches EOF (i.e. one end of the pipeline exited), cancel signals the others
+    // to drain buffered bytes and stop.
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
     var wg sync.WaitGroup
 
     // Build composed writers for logging
@@ -288,12 +352,13 @@ func main() {
     go func() {
         defer wg.Done()
         defer childStdin.Close()
+        defer cancel()
         writers := []io.Writer{childStdin}
         if stdinLogger != nil {
             writers = append(writers, stdinLogger)
         }
         teeWriter := NewTeeWriter(writers...)
-        tee(os.Stdin, teeWriter)
+        tee(ctx, os.Stdin, teeWriter)
         if stdinLogger != nil {
             stdinLogger.Flush()
         }
@@ -303,12 +368,13 @@ func main() {
     wg.Add(1)
     go func() {
         defer wg.Done()
+        defer cancel()
         writers := []io.Writer{os.Stdout}
         if stdoutLogger != nil {
             writers = append(writers, stdoutLogger)
         }
         teeWriter := NewTeeWriter(writers...)
-        tee(childStdout, teeWriter)
+        tee(ctx, childStdout, teeWriter)
         if stdoutLogger != nil {
             stdoutLogger.Flush()
         }
@@ -318,12 +384,13 @@ func main() {
     wg.Add(1)
     go func() {
         defer wg.Done()
+        defer cancel()
         writers := []io.Writer{os.Stderr}
         if stderrLogger != nil {
             writers = append(writers, stderrLogger)
         }
         teeWriter := NewTeeWriter(writers...)
-        tee(childStderr, teeWriter)
+        tee(ctx, childStderr, teeWriter)
         if stderrLogger != nil {
             stderrLogger.Flush()
         }
